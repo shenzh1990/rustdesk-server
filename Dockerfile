@@ -1,4 +1,4 @@
-﻿# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7
 
 ############################
 # 1) Build stage
@@ -8,8 +8,8 @@ FROM rust:1.81-bookworm AS builder
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential pkg-config cmake clang perl \
-    libssl-dev libsodium-dev protobuf-compiler \
+    build-essential pkg-config cmake clang perl git ca-certificates \
+    libssl-dev libsodium-dev protobuf-compiler libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock ./
@@ -65,3 +65,4 @@ kill -TERM $HBBS_PID $HBBR_PID 2>/dev/null || true; \
 wait || true; \
 exit $EXIT_CODE \
 "]
+
