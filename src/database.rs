@@ -58,8 +58,10 @@ pub struct AdminUser {
 #[derive(Clone, Debug, Default)]
 pub struct PeerRecord {
     pub id: String,
+    pub name: Option<String>,
     pub created_at: String,
     pub status: Option<i64>,
+    pub is_controlled: i64,
     pub note: Option<String>,
     pub info: String,
 }
@@ -129,11 +131,13 @@ impl Database {
             create table if not exists peer (
                 guid blob primary key not null,
                 id varchar(100) not null,
+                name varchar(120),
                 uuid blob not null,
                 pk blob not null,
                 created_at datetime not null default(current_timestamp),
                 user blob,
                 status tinyint,
+                is_controlled tinyint not null default 0,
                 note varchar(300),
                 info text not null
             ) without rowid;
@@ -245,6 +249,16 @@ impl Database {
                 .execute(self.pool.get().await?.deref_mut())
                 .await?;
         }
+        if !self.table_has_column("peer", "is_controlled").await? {
+            sqlx::query("alter table peer add column is_controlled tinyint not null default 0")
+                .execute(self.pool.get().await?.deref_mut())
+                .await?;
+        }
+        if !self.table_has_column("peer", "name").await? {
+            sqlx::query("alter table peer add column name varchar(120)")
+                .execute(self.pool.get().await?.deref_mut())
+                .await?;
+        }
         Ok(())
     }
 
@@ -314,7 +328,7 @@ impl Database {
 
     pub async fn list_peers(&self) -> ResultType<Vec<PeerRecord>> {
         let rows = sqlx::query(
-            "select id, created_at, status, note, info from peer order by datetime(created_at) desc",
+            "select id, name, created_at, status, is_controlled, note, info from peer order by datetime(created_at) desc",
         )
         .fetch_all(self.pool.get().await?.deref_mut())
         .await?;
@@ -322,8 +336,10 @@ impl Database {
         for row in rows {
             out.push(PeerRecord {
                 id: row.try_get("id")?,
+                name: row.try_get("name").ok(),
                 created_at: row.try_get("created_at")?,
                 status: row.try_get("status").ok(),
+                is_controlled: row.try_get("is_controlled").unwrap_or(0),
                 note: row.try_get("note").ok(),
                 info: row.try_get("info").unwrap_or_default(),
             });
@@ -459,6 +475,50 @@ impl Database {
         Ok(())
     }
 
+    pub async fn set_peer_controlled(&self, client_id: &str, is_controlled: i64) -> ResultType<()> {
+        sqlx::query("update peer set is_controlled = ? where id = ?")
+            .bind(if is_controlled == 0 { 0 } else { 1 })
+            .bind(client_id)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_peer_name(&self, client_id: &str, name: Option<&str>) -> ResultType<()> {
+        let normalized = name
+            .map(|x| x.trim())
+            .filter(|x| !x.is_empty())
+            .map(|x| x.chars().take(120).collect::<String>());
+        sqlx::query("update peer set name = ? where id = ?")
+            .bind(normalized)
+            .bind(client_id)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_peer_record(&self, client_id: &str) -> ResultType<Option<PeerRecord>> {
+        let row = sqlx::query(
+            "select id, name, created_at, status, is_controlled, note, info from peer where id = ?",
+        )
+        .bind(client_id)
+        .fetch_optional(self.pool.get().await?.deref_mut())
+        .await?;
+        if let Some(row) = row {
+            Ok(Some(PeerRecord {
+                id: row.try_get("id")?,
+                name: row.try_get("name").ok(),
+                created_at: row.try_get("created_at")?,
+                status: row.try_get("status").ok(),
+                is_controlled: row.try_get("is_controlled").unwrap_or(0),
+                note: row.try_get("note").ok(),
+                info: row.try_get("info").unwrap_or_default(),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub async fn delete_peer(&self, client_id: &str) -> ResultType<()> {
         sqlx::query("delete from user_client_acl where client_id = ?")
             .bind(client_id)
@@ -571,7 +631,8 @@ impl Database {
             "select distinct gm.peer_id
              from user_group_acl uga
              inner join device_group_member gm on gm.group_id = uga.group_id
-             where uga.user_id = ?",
+             inner join peer p on p.id = gm.peer_id
+             where uga.user_id = ? and p.is_controlled = 1",
         )
         .bind(user_id)
         .fetch_all(self.pool.get().await?.deref_mut())

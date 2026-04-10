@@ -25,6 +25,12 @@ def main() -> int:
     p_delete = sub.add_parser("delete", help="delete device")
     p_delete.add_argument("peer_id")
 
+    p_mark = sub.add_parser("mark-controlled", help="mark device as controlled endpoint")
+    p_mark.add_argument("peer_id")
+
+    p_unmark = sub.add_parser("unmark-controlled", help="remove controlled endpoint mark")
+    p_unmark.add_argument("peer_id")
+
     args = parser.parse_args()
 
     if args.cmd == "env":
@@ -52,6 +58,14 @@ def main() -> int:
 
     if args.cmd == "delete":
         json_print(request(f"/api/peers/{args.peer_id}", method="DELETE", token=token))
+        return 0
+
+    if args.cmd == "mark-controlled":
+        json_print(request(f"/api/peers/{args.peer_id}/mark-controlled", method="POST", token=token))
+        return 0
+
+    if args.cmd == "unmark-controlled":
+        json_print(request(f"/api/peers/{args.peer_id}/unmark-controlled", method="POST", token=token))
         return 0
 
     parser.print_help()

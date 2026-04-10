@@ -41,7 +41,7 @@ This workspace includes a built-in admin console/API on `--api-port` (default `h
 - Login API: `POST /api/login`
 - Current user: `GET /api/currentUser`
 - Users: `GET/POST /api/users`, `POST /api/users/:id/enable|disable`, `DELETE /api/users/:id`
-- Devices: `GET /api/peers`, `POST /api/peers/:id/enable|disable`, `DELETE /api/peers/:id`
+- Devices: `GET /api/peers`, `POST /api/peers/:id/enable|disable`, `POST /api/peers/:id/mark-controlled|unmark-controlled`, `DELETE /api/peers/:id`
 - User-device ACL: `GET /api/users/:id/peers`, `POST/DELETE /api/users/:id/peers/:peer_id`
 - Connection audits: `GET /api/audits/conn`
 

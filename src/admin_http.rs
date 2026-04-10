@@ -9,7 +9,7 @@ use axum::{
 use hbb_common::log;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde_derive::{Deserialize, Serialize};
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::{HashMap, HashSet}, sync::Arc};
 use tower_http::cors::CorsLayer;
 
 #[derive(Clone)]
@@ -72,8 +72,10 @@ struct CurrentUserResp {
 #[derive(Debug, Serialize)]
 struct ClientDto {
     id: String,
+    name: Option<String>,
     created_at: String,
     status: Option<i64>,
+    is_controlled: bool,
     note: Option<String>,
     online: bool,
     last_seen_secs: Option<u64>,
@@ -162,6 +164,11 @@ struct AuditUpdateReq {
     note: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct UpdatePeerNameReq {
+    name: Option<String>,
+}
+
 pub(crate) fn spawn_admin_http(pm: PeerMap, api_port: i32) {
     if api_port <= 0 || api_port > u16::MAX as i32 {
         log::error!("Invalid API port: {}", api_port);
@@ -205,6 +212,11 @@ pub(crate) fn spawn_admin_http(pm: PeerMap, api_port: i32) {
         .route("/api/peers/:peer_id", delete(delete_peer))
         .route("/api/peers/:peer_id/enable", post(enable_peer))
         .route("/api/peers/:peer_id/disable", post(disable_peer))
+        .route("/api/peers/:peer_id/name", put(update_peer_name))
+        .route("/api/peers/:peer_id/mark-controlled", post(mark_controlled_peer))
+        .route("/api/peers/:peer_id/unmark-controlled", post(unmark_controlled_peer))
+        .route("/api/tree/groups", get(group_tree))
+        .route("/api/tree/users", get(user_tree))
         .route("/api/users/:user_id/peers", get(list_user_peers))
         .route(
             "/api/users/:user_id/peers/:peer_id",
@@ -583,42 +595,72 @@ async fn compat_login(
     Json(req): Json<CompatLoginReq>,
 ) -> Json<serde_json::Value> {
     let req_type = req.req_type.unwrap_or_else(|| "account".to_owned());
-    if req_type != "account" && req_type != "mobile" {
-        return Json(serde_json::json!({ "error": "Unsupported login type" }));
-    }
     let username = req.username.unwrap_or_default();
     let password = req.password.unwrap_or_default();
-    if username.trim().is_empty() || password.is_empty() {
+    let peer_id = req.id.unwrap_or_default();
+
+    if !username.trim().is_empty() || !password.is_empty() {
+        if req_type != "account" && req_type != "mobile" {
+            return Json(serde_json::json!({ "error": "Unsupported login type" }));
+        }
+        if username.trim().is_empty() || password.is_empty() {
+            return Json(serde_json::json!({ "error": "Invalid username or password" }));
+        }
+        let user = match state.pm.db.get_user_by_name(username.trim()).await {
+            Ok(Some(v)) => v,
+            _ => return Json(serde_json::json!({ "error": "Invalid username or password" })),
+        };
+        if user.status == 0 {
+            return Json(serde_json::json!({ "error": "User is disabled" }));
+        }
+        if !bcrypt::verify(password, &user.password_hash).unwrap_or(false) {
+            return Json(serde_json::json!({ "error": "Invalid username or password" }));
+        }
+        let claims = Claims {
+            sub: user.id,
+            username: user.username.clone(),
+            role: user.role.clone(),
+            exp: (chrono::Utc::now().timestamp() + 12 * 3600) as usize,
+        };
+        let token = match encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+        ) {
+            Ok(v) => v,
+            Err(err) => return Json(serde_json::json!({ "error": err.to_string() })),
+        };
+        return Json(serde_json::json!({
+            "type": "access_token",
+            "access_token": token,
+            "user": compat_user_payload(&user.username, &user.role, user.status)
+        }));
+    }
+
+    if peer_id.trim().is_empty() {
         return Json(serde_json::json!({ "error": "Invalid username or password" }));
     }
-    let user = match state.pm.db.get_user_by_name(username.trim()).await {
+
+    let peer = match state.pm.db.get_peer_record(peer_id.trim()).await {
         Ok(Some(v)) => v,
-        _ => return Json(serde_json::json!({ "error": "Invalid username or password" })),
-    };
-    if user.status == 0 {
-        return Json(serde_json::json!({ "error": "User is disabled" }));
-    }
-    if !bcrypt::verify(password, &user.password_hash).unwrap_or(false) {
-        return Json(serde_json::json!({ "error": "Invalid username or password" }));
-    }
-    let claims = Claims {
-        sub: user.id,
-        username: user.username.clone(),
-        role: user.role.clone(),
-        exp: (chrono::Utc::now().timestamp() + 12 * 3600) as usize,
-    };
-    let token = match encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
-    ) {
-        Ok(v) => v,
+        Ok(None) => return Json(serde_json::json!({ "error": "Device not found" })),
         Err(err) => return Json(serde_json::json!({ "error": err.to_string() })),
     };
+    if peer.status.unwrap_or(1) == 0 {
+        return Json(serde_json::json!({ "error": "Device is disabled" }));
+    }
+    if peer.is_controlled == 0 {
+        return Json(serde_json::json!({ "error": "Device is not marked as controlled endpoint" }));
+    }
     Json(serde_json::json!({
         "type": "access_token",
-        "access_token": token,
-        "user": compat_user_payload(&user.username, &user.role, user.status)
+        "access_token": "",
+        "user": compat_user_payload(peer_id.trim(), "device", 1),
+        "device": {
+            "id": peer_id.trim(),
+            "is_controlled": true,
+            "skip_login": true
+        }
     }))
 }
 
@@ -717,7 +759,7 @@ async fn peers_dispatch(
     let filtered: Vec<_> = rows
         .into_iter()
         .filter(|r| match &allow_set {
-            Some(ids) => ids.contains(&r.id),
+            Some(ids) => ids.contains(&r.id) && r.is_controlled != 0,
             None => true,
         })
         .collect();
@@ -741,8 +783,10 @@ async fn peers_dispatch(
                     .unwrap_or_else(|_| serde_json::json!({}));
                 serde_json::json!({
                     "id": r.id,
+                    "name": r.name.clone().unwrap_or_default(),
                     "info": info,
                     "status": r.status.unwrap_or(1),
+                    "is_controlled": r.is_controlled != 0,
                     "user": "",
                     "user_name": "",
                     "device_group_name": "",
@@ -759,8 +803,10 @@ async fn peers_dispatch(
             let rt = runtime.get(&r.id);
             ClientDto {
                 id: r.id,
+                name: r.name,
                 created_at: r.created_at,
                 status: r.status,
+                is_controlled: r.is_controlled != 0,
                 note: r.note,
                 online: rt.map(|x| x.online).unwrap_or(false),
                 last_seen_secs: rt.map(|x| x.last_seen_secs),
@@ -994,15 +1040,17 @@ async fn list_clients(
     let out = rows
         .into_iter()
         .filter(|r| match &allow_set {
-            Some(ids) => ids.contains(&r.id),
+            Some(ids) => ids.contains(&r.id) && r.is_controlled != 0,
             None => true,
         })
         .map(|r| {
             let rt = runtime.get(&r.id);
             ClientDto {
                 id: r.id,
+                name: r.name,
                 created_at: r.created_at,
                 status: r.status,
+                is_controlled: r.is_controlled != 0,
                 note: r.note,
                 online: rt.map(|x| x.online).unwrap_or(false),
                 last_seen_secs: rt.map(|x| x.last_seen_secs),
@@ -1029,6 +1077,49 @@ async fn disable_peer(
     set_peer_status(state, headers, peer_id, 0).await
 }
 
+async fn update_peer_name(
+    Extension(state): Extension<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(peer_id): Path<String>,
+    Json(req): Json<UpdatePeerNameReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    let claims = auth_claims(&state, &headers)?;
+    require_admin(&claims)?;
+    let peer_id = peer_id.trim().to_owned();
+    let peer = state
+        .pm
+        .db
+        .get_peer_record(&peer_id)
+        .await
+        .map_err(internal_err)?;
+    if peer.is_none() {
+        return Err(not_found("Peer not found"));
+    }
+    state
+        .pm
+        .db
+        .set_peer_name(&peer_id, req.name.as_deref())
+        .await
+        .map_err(internal_err)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn mark_controlled_peer(
+    Extension(state): Extension<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(peer_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    set_peer_controlled(state, headers, peer_id, 1).await
+}
+
+async fn unmark_controlled_peer(
+    Extension(state): Extension<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(peer_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    set_peer_controlled(state, headers, peer_id, 0).await
+}
+
 async fn set_peer_status(
     state: Arc<AppState>,
     headers: HeaderMap,
@@ -1041,6 +1132,33 @@ async fn set_peer_status(
         .pm
         .db
         .set_peer_status(peer_id.trim(), status)
+        .await
+        .map_err(internal_err)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn set_peer_controlled(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    peer_id: String,
+    is_controlled: i64,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    let claims = auth_claims(&state, &headers)?;
+    require_admin(&claims)?;
+    let peer_id = peer_id.trim().to_owned();
+    let peer = state
+        .pm
+        .db
+        .get_peer_record(&peer_id)
+        .await
+        .map_err(internal_err)?;
+    if peer.is_none() {
+        return Err(not_found("Peer not found"));
+    }
+    state
+        .pm
+        .db
+        .set_peer_controlled(&peer_id, is_controlled)
         .await
         .map_err(internal_err)?;
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -1087,10 +1205,24 @@ async fn grant_user_peer(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
     let claims = auth_claims(&state, &headers)?;
     require_admin(&claims)?;
+    let peer_id = peer_id.trim().to_owned();
+    let peer = state
+        .pm
+        .db
+        .get_peer_record(&peer_id)
+        .await
+        .map_err(internal_err)?;
+    let peer = match peer {
+        Some(v) => v,
+        None => return Err(not_found("Peer not found")),
+    };
+    if peer.is_controlled == 0 {
+        return Err(bad_req("Only controlled devices can be assigned to users"));
+    }
     state
         .pm
         .db
-        .grant_user_client_acl(user_id, peer_id.trim())
+        .grant_user_client_acl(user_id, &peer_id)
         .await
         .map_err(internal_err)?;
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -1229,10 +1361,24 @@ async fn add_group_peer(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
     let claims = auth_claims(&state, &headers)?;
     require_admin(&claims)?;
+    let peer_id = peer_id.trim().to_owned();
+    let peer = state
+        .pm
+        .db
+        .get_peer_record(&peer_id)
+        .await
+        .map_err(internal_err)?;
+    let peer = match peer {
+        Some(v) => v,
+        None => return Err(not_found("Peer not found")),
+    };
+    if peer.is_controlled == 0 {
+        return Err(bad_req("Only controlled devices can be added into groups"));
+    }
     state
         .pm
         .db
-        .add_group_peer(group_id, peer_id.trim())
+        .add_group_peer(group_id, &peer_id)
         .await
         .map_err(internal_err)?;
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -1272,6 +1418,160 @@ async fn list_conn_audits(
             })
             .collect(),
     ))
+}
+
+async fn group_tree(
+    Extension(state): Extension<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
+    let claims = auth_claims(&state, &headers)?;
+    require_admin(&claims)?;
+
+    let groups = state.pm.db.list_groups().await.map_err(internal_err)?;
+    let peers = state.pm.db.list_peers().await.map_err(internal_err)?;
+    let runtime = state.pm.get_runtime_status().await;
+    let peer_map: HashMap<String, crate::database::PeerRecord> =
+        peers.into_iter().map(|p| (p.id.clone(), p)).collect();
+
+    let mut out = Vec::with_capacity(groups.len());
+    for g in groups {
+        let member_ids = state
+            .pm
+            .db
+            .list_group_peers(g.id)
+            .await
+            .map_err(internal_err)?;
+        let members: Vec<serde_json::Value> = member_ids
+            .into_iter()
+            .map(|id| {
+                if let Some(p) = peer_map.get(&id) {
+                    let rt = runtime.get(&id);
+                    serde_json::json!({
+                        "id": id,
+                        "name": p.name.clone().unwrap_or_default(),
+                        "status": p.status.unwrap_or(1),
+                        "is_controlled": p.is_controlled != 0,
+                        "online": rt.map(|x| x.online).unwrap_or(false),
+                        "last_seen_secs": rt.map(|x| x.last_seen_secs),
+                    })
+                } else {
+                    serde_json::json!({ "id": id })
+                }
+            })
+            .collect();
+        out.push(serde_json::json!({
+            "id": g.id,
+            "name": g.name,
+            "created_at": g.created_at,
+            "devices": members
+        }));
+    }
+    Ok(Json(out))
+}
+
+async fn user_tree(
+    Extension(state): Extension<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
+    let claims = auth_claims(&state, &headers)?;
+    let users = if claims.role == "admin" {
+        state.pm.db.list_users().await.map_err(internal_err)?
+    } else {
+        match state
+            .pm
+            .db
+            .get_user_by_id(claims.sub)
+            .await
+            .map_err(internal_err)?
+        {
+            Some(u) => vec![u],
+            None => vec![],
+        }
+    };
+    let groups = state.pm.db.list_groups().await.map_err(internal_err)?;
+    let peers = state.pm.db.list_peers().await.map_err(internal_err)?;
+    let runtime = state.pm.get_runtime_status().await;
+    let group_map: HashMap<i64, crate::database::DeviceGroup> =
+        groups.into_iter().map(|g| (g.id, g)).collect();
+    let peer_map: HashMap<String, crate::database::PeerRecord> =
+        peers.into_iter().map(|p| (p.id.clone(), p)).collect();
+
+    let mut out = Vec::with_capacity(users.len());
+    for u in users {
+        let direct_ids = state
+            .pm
+            .db
+            .list_user_client_acl(u.id)
+            .await
+            .map_err(internal_err)?;
+        let group_ids = state
+            .pm
+            .db
+            .list_user_group_acl(u.id)
+            .await
+            .map_err(internal_err)?;
+
+        let direct_devices: Vec<serde_json::Value> = direct_ids
+            .into_iter()
+            .map(|id| {
+                if let Some(p) = peer_map.get(&id) {
+                    let rt = runtime.get(&id);
+                    serde_json::json!({
+                        "id": id,
+                        "name": p.name.clone().unwrap_or_default(),
+                        "status": p.status.unwrap_or(1),
+                        "is_controlled": p.is_controlled != 0,
+                        "online": rt.map(|x| x.online).unwrap_or(false),
+                    })
+                } else {
+                    serde_json::json!({ "id": id })
+                }
+            })
+            .collect();
+
+        let mut groups_json = Vec::new();
+        for gid in group_ids {
+            let members = state
+                .pm
+                .db
+                .list_group_peers(gid)
+                .await
+                .map_err(internal_err)?;
+            let peers_json: Vec<serde_json::Value> = members
+                .into_iter()
+                .map(|id| {
+                    if let Some(p) = peer_map.get(&id) {
+                        let rt = runtime.get(&id);
+                        serde_json::json!({
+                            "id": id,
+                            "name": p.name.clone().unwrap_or_default(),
+                            "status": p.status.unwrap_or(1),
+                            "is_controlled": p.is_controlled != 0,
+                            "online": rt.map(|x| x.online).unwrap_or(false),
+                        })
+                    } else {
+                        serde_json::json!({ "id": id })
+                    }
+                })
+                .collect();
+            let g = group_map.get(&gid);
+            groups_json.push(serde_json::json!({
+                "id": gid,
+                "name": g.map(|x| x.name.clone()).unwrap_or_else(|| format!("Group-{gid}")),
+                "devices": peers_json
+            }));
+        }
+
+        out.push(serde_json::json!({
+            "id": u.id,
+            "username": u.username,
+            "role": u.role,
+            "status": u.status,
+            "groups": groups_json,
+            "direct_devices": direct_devices
+        }));
+    }
+    Ok(Json(out))
 }
 
 fn auth_claims(
@@ -1342,6 +1642,7 @@ const ADMIN_LOGIN_HTML: &str = r##"<!doctype html>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>RustDesk Console Login</title>
+  <link rel="stylesheet" href="https://unpkg.com/element-plus@2.11.5/dist/index.css" />
   <link rel="stylesheet" href="/admin/style.css" />
 </head>
 <body class="bg-grid">
@@ -1358,7 +1659,7 @@ const ADMIN_LOGIN_HTML: &str = r##"<!doctype html>
         <input id="password" placeholder="Enter password" type="password" />
       </div>
       <div class="row">
-        <button id="loginBtn" class="btn-primary w-full">Sign in</button>
+        <button id="loginBtn" class="btn-primary w-full el-button el-button--primary">Sign in</button>
       </div>
       <div id="loginMsg" class="hint"></div>
       <p class="subtle tiny">Default account: admin / admin123456</p>
@@ -1375,118 +1676,222 @@ const ADMIN_DASHBOARD_HTML: &str = r##"<!doctype html>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>RustDesk Workplace</title>
+  <link rel="stylesheet" href="https://unpkg.com/element-plus@2.11.5/dist/index.css" />
   <link rel="stylesheet" href="/admin/style.css" />
 </head>
 <body class="work-bg">
-  <header class="topbar glass">
-    <div>
-      <h1 class="brand">RustDesk Workplace</h1>
-      <p class="subtle" id="welcomeText">加载中...</p>
-    </div>
-    <div class="row-inline">
-      <button id="refreshAllBtn" class="btn-primary">刷新全局</button>
-      <button id="refreshAuditsBtn" class="btn-ghost">刷新审计</button>
-      <button id="logoutBtn" class="btn-ghost">退出登录</button>
-    </div>
-  </header>
-
-  <main class="workplace">
-    <section class="hero-card glass card">
-      <div>
-        <h2>工作台</h2>
-        <p class="subtle">用户、设备、连接审计统一看板</p>
+  <div class="console-shell">
+    <aside class="sidebar glass">
+      <div class="sidebar-brand">
+        <h1 class="brand">RustDesk Workplace</h1>
+        <p class="subtle" id="welcomeText">加载中...</p>
       </div>
-      <div class="hero-meta">
-        <div class="meta-item"><span>当前时间</span><strong id="clockText">--:--:--</strong></div>
-        <div class="meta-item"><span>API</span><strong>/api</strong></div>
+      <nav class="menu">
+        <button class="menu-item active" data-panel="overviewPanel">总览</button>
+        <button class="menu-item" data-panel="clientsPanel">设备管理</button>
+        <button class="menu-item admin-only" data-panel="usersPanel">用户管理</button>
+        <button class="menu-item" data-panel="myTreePanel">用户关联树</button>
+        <button class="menu-item admin-only" data-panel="groupsPanel">设备组管理</button>
+        <button class="menu-item admin-only" data-panel="auditsPanel">连接审计</button>
+      </nav>
+      <div class="sidebar-foot subtle tiny">API Base: /api</div>
+    </aside>
+
+    <main class="main-pane">
+      <header class="topbar glass">
+        <div>
+          <h2 id="panelTitle">总览</h2>
+          <p class="subtle">当前时间：<strong id="clockText">--:--:--</strong></p>
+        </div>
+        <div class="row-inline">
+          <button id="refreshAllBtn" class="btn-primary el-button el-button--primary">刷新全局</button>
+          <button id="refreshAuditsBtn" class="btn-ghost el-button">刷新审计</button>
+          <button id="logoutBtn" class="btn-ghost el-button">退出登录</button>
+        </div>
+      </header>
+
+      <datalist id="peerIdCandidates"></datalist>
+      <div id="peerSuggest" class="peer-suggest hidden"></div>
+      <div id="groupAclModal" class="modal-mask hidden">
+        <div class="modal-card glass">
+          <div class="panel-head">
+            <h2 id="groupAclTitle">设备组成员管理</h2>
+          </div>
+          <p id="groupAclMeta" class="subtle tiny">-</p>
+          <div class="row">
+            <label class="form-label">添加设备</label>
+            <div class="row-inline">
+              <input id="groupAclPeerInput" class="aclPeer" placeholder="请输入设备ID" />
+              <button id="groupAclAddBtn" class="btn-primary el-button el-button--primary">添加</button>
+            </div>
+          </div>
+          <div class="row">
+            <label class="form-label">当前设备</label>
+            <div id="groupAclMembers" class="tag-wall subtle">暂无设备</div>
+          </div>
+          <div class="row-inline modal-actions">
+            <button id="groupAclCloseBtn" class="btn-ghost el-button">关闭</button>
+          </div>
+        </div>
       </div>
-    </section>
 
-    <section class="kpi-grid">
-      <article class="kpi-card glass">
-        <p>用户总数</p>
-        <h3 id="kpiUsers">0</h3>
-      </article>
-      <article class="kpi-card glass">
-        <p>启用用户</p>
-        <h3 id="kpiUsersEnabled">0</h3>
-      </article>
-      <article class="kpi-card glass">
-        <p>设备总数</p>
-        <h3 id="kpiPeers">0</h3>
-      </article>
-      <article class="kpi-card glass">
-        <p>在线设备</p>
-        <h3 id="kpiPeersOnline">0</h3>
-      </article>
-    </section>
+      <div id="userAclModal" class="modal-mask hidden">
+        <div class="modal-card modal-lg glass">
+          <div class="panel-head">
+            <h2 id="userAclTitle">用户权限管理</h2>
+          </div>
+          <p id="userAclMeta" class="subtle tiny">-</p>
+          <div class="row row-inline">
+            <div>
+              <label class="form-label">授权设备</label>
+              <div class="row-inline">
+                <input id="userAclPeerInput" class="aclPeer" placeholder="请输入设备ID" />
+                <button id="userAclAddPeerBtn" class="btn-primary el-button el-button--primary">添加设备</button>
+              </div>
+            </div>
+            <div>
+              <label class="form-label">授权设备组</label>
+              <div class="row-inline">
+                <select id="userAclGroupSelect"></select>
+                <button id="userAclAddGroupBtn" class="btn-primary el-button el-button--primary">添加设备组</button>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <label class="form-label">当前设备授权</label>
+            <div id="userAclPeers" class="tag-wall subtle">暂无设备授权</div>
+          </div>
+          <div class="row">
+            <label class="form-label">当前设备组授权</label>
+            <div id="userAclGroups" class="tag-wall subtle">暂无设备组授权</div>
+          </div>
+          <div class="row-inline modal-actions">
+            <button id="userAclCloseBtn" class="btn-ghost el-button">关闭</button>
+          </div>
+        </div>
+      </div>
 
-    <section class="panel-grid">
-      <section class="card glass panel" id="groupCard">
-        <div class="panel-head">
-          <h2>设备组管理</h2>
-          <span class="subtle tiny">创建组、添加设备、授权给用户</span>
-        </div>
-        <div class="row row-inline">
-          <input id="newGroup" placeholder="设备组名称" />
-          <button id="createGroupBtn" class="btn-primary">创建设备组</button>
-        </div>
-        <div class="table-wrap">
-          <table id="groupsTbl">
-            <thead><tr><th>ID</th><th>名称</th><th>成员设备</th><th>创建时间</th><th>操作</th></tr></thead>
-            <tbody></tbody>
-          </table>
-        </div>
-      </section>
-      <section class="card glass panel" id="userCard">
-        <div class="panel-head">
-          <h2>用户管理</h2>
-          <span class="subtle tiny">创建、启停、删除、授权</span>
-        </div>
-        <div class="row row-inline">
-          <input id="newUser" placeholder="新用户名" />
-          <input id="newPass" placeholder="新密码" type="password" />
-          <select id="newRole">
-            <option value="user">user</option>
-            <option value="admin">admin</option>
-          </select>
-          <button id="createUserBtn" class="btn-primary">创建用户</button>
-        </div>
-        <div class="table-wrap">
-          <table id="usersTbl">
-            <thead><tr><th>ID</th><th>用户名</th><th>角色</th><th>状态</th><th>创建时间</th><th>设备授权</th><th>设备组授权</th><th>操作</th></tr></thead>
-            <tbody></tbody>
-          </table>
-        </div>
-      </section>
-
-      <section class="card glass panel">
-        <div class="panel-head">
-          <h2>设备管理</h2>
-          <span class="subtle tiny">在线态 + DB 状态</span>
-        </div>
-        <div class="table-wrap">
-          <table id="clientsTbl">
-            <thead><tr><th>设备ID</th><th>在线状态</th><th>DB状态</th><th>最近心跳(秒)</th><th>IP</th><th>创建时间</th><th>操作</th></tr></thead>
-            <tbody></tbody>
-          </table>
-        </div>
+      <section class="panel-view active" id="overviewPanel" data-title="总览">
+        <section class="kpi-grid">
+          <article class="kpi-card glass">
+            <p>用户总数</p>
+            <h3 id="kpiUsers">0</h3>
+          </article>
+          <article class="kpi-card glass">
+            <p>启用用户</p>
+            <h3 id="kpiUsersEnabled">0</h3>
+          </article>
+          <article class="kpi-card glass">
+            <p>设备总数</p>
+            <h3 id="kpiPeers">0</h3>
+          </article>
+          <article class="kpi-card glass">
+            <p>在线设备</p>
+            <h3 id="kpiPeersOnline">0</h3>
+          </article>
+        </section>
+        <section class="card glass panel">
+          <div class="panel-head">
+            <h2>工作台说明</h2>
+            <span class="subtle tiny">左侧切换模块，右侧执行管理操作</span>
+          </div>
+          <p class="subtle">
+            支持设备被控端标记、用户授权、设备组授权和连接审计。设备ID输入框支持模糊搜索与回填。
+          </p>
+        </section>
       </section>
 
-      <section class="card glass panel" id="auditCard">
-        <div class="panel-head">
-          <h2>连接审计</h2>
-          <span class="subtle tiny">最近打洞请求记录</span>
-        </div>
-        <div class="table-wrap">
-          <table id="auditTbl">
-            <thead><tr><th>时间(UTC)</th><th>来源IP</th><th>目标设备ID</th><th>目标IP</th></tr></thead>
-            <tbody></tbody>
-          </table>
-        </div>
+      <section class="panel-view" id="clientsPanel" data-title="设备管理">
+        <section class="card glass panel">
+          <div class="panel-head">
+            <h2>设备管理</h2>
+            <span class="subtle tiny">在线态 + DB 状态 + 被控端标记</span>
+          </div>
+          <div class="table-wrap">
+            <table id="clientsTbl">
+              <thead><tr><th>设备ID</th><th>名称</th><th>在线状态</th><th>DB状态</th><th>设备类型</th><th>最近心跳(秒)</th><th>IP</th><th>创建时间</th><th>操作</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
       </section>
-    </section>
-  </main>
+
+      <section class="panel-view" id="myTreePanel" data-title="用户关联树">
+        <section class="card glass panel">
+          <div class="panel-head">
+            <h2>用户关联树</h2>
+            <span class="subtle tiny">用户 -> 设备组 -> 设备，以及直接授权设备</span>
+          </div>
+          <div id="userTreeBox" class="tree-box subtle">加载中...</div>
+        </section>
+      </section>
+
+      <section class="panel-view" id="usersPanel" data-title="用户管理">
+        <section class="card glass panel" id="userCard">
+          <div class="panel-head">
+            <h2>用户管理</h2>
+            <span class="subtle tiny">创建、启停、删除、授权</span>
+          </div>
+          <div class="row row-inline">
+            <input id="newUser" placeholder="新用户名" />
+            <input id="newPass" placeholder="新密码" type="password" />
+            <select id="newRole">
+              <option value="user">user</option>
+              <option value="admin">admin</option>
+            </select>
+            <button id="createUserBtn" class="btn-primary el-button el-button--primary">创建用户</button>
+          </div>
+          <div class="table-wrap">
+            <table id="usersTbl">
+              <thead><tr><th>ID</th><th>用户名</th><th>角色</th><th>状态</th><th>创建时间</th><th>设备授权</th><th>设备组授权</th><th>操作</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section class="panel-view" id="groupsPanel" data-title="设备组管理">
+        <section class="card glass panel" id="groupCard">
+          <div class="panel-head">
+            <h2>设备组管理</h2>
+            <span class="subtle tiny">创建组、添加设备、授权给用户</span>
+          </div>
+          <div class="row row-inline">
+            <input id="newGroup" placeholder="设备组名称" />
+            <button id="createGroupBtn" class="btn-primary el-button el-button--primary">创建设备组</button>
+          </div>
+          <div class="table-wrap">
+            <table id="groupsTbl">
+              <thead><tr><th>ID</th><th>名称</th><th>成员设备</th><th>创建时间</th><th>操作</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+        <section class="card glass panel" id="groupTreeCard">
+          <div class="panel-head">
+            <h2>设备组树</h2>
+            <span class="subtle tiny">设备组 -> 设备</span>
+          </div>
+          <div id="groupTreeBox" class="tree-box subtle">加载中...</div>
+        </section>
+      </section>
+
+      <section class="panel-view" id="auditsPanel" data-title="连接审计">
+        <section class="card glass panel" id="auditCard">
+          <div class="panel-head">
+            <h2>连接审计</h2>
+            <span class="subtle tiny">最近打洞请求记录</span>
+          </div>
+          <div class="table-wrap">
+            <table id="auditTbl">
+              <thead><tr><th>时间(UTC)</th><th>来源IP</th><th>目标设备ID</th><th>目标IP</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+    </main>
+  </div>
   <script src="/admin/dashboard.js"></script>
 </body>
 </html>
@@ -1494,120 +1899,344 @@ const ADMIN_DASHBOARD_HTML: &str = r##"<!doctype html>
 
 const ADMIN_STYLE_CSS: &str = r##"
 :root {
-  --bg: #f3f6fb;
-  --ink: #1f2a37;
-  --muted: #6b7280;
-  --line: #e5eaf3;
-  --card: rgba(255,255,255,0.9);
-  --ok: #0f766e;
-  --warn: #b45309;
+  --bg: #f5f7fa;
+  --ink: #303133;
+  --muted: #606266;
+  --line: #dcdfe6;
+  --card: #ffffff;
   --danger: #dc2626;
-  --accent: #1677ff;
-  --accent-2: #4096ff;
+  --accent: #409eff;
+  --accent-2: #337ecc;
+  --menu: #ffffff;
+  --menu-2: #ffffff;
+  --el-shadow-light: 0 2px 12px 0 rgba(0, 0, 0, 0.1);
 }
-* { box-sizing: border-box; }
+
+* {
+  box-sizing: border-box;
+}
+
 body {
   margin: 0;
   color: var(--ink);
-  font: 14px/1.6 "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font: 14px/1.6 "Helvetica Neue", Helvetica, "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
 }
+
+.bg-grid {
+  min-height: 100vh;
+  background: var(--bg);
+}
+
+.login-wrap {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+}
+
+.login-card {
+  width: min(420px, 100%);
+}
+
+.hint {
+  margin: 8px 0 10px;
+  color: var(--muted);
+}
+
+.hint.ok {
+  color: #166534;
+}
+
+.hint.err {
+  color: var(--danger);
+}
+
+.w-full {
+  width: 100%;
+}
+
 .work-bg {
-  background:
-    radial-gradient(800px 340px at 90% -10%, rgba(22,119,255,.17), transparent 60%),
-    radial-gradient(680px 280px at -10% -20%, rgba(34,197,94,.09), transparent 60%),
-    var(--bg);
+  background: var(--bg);
   min-height: 100vh;
 }
+
 .glass {
   background: var(--card);
-  border: 1px solid rgba(255,255,255,.7);
-  box-shadow: 0 10px 28px rgba(15,23,42,.08);
-  backdrop-filter: blur(5px);
-}
-.card { border-radius: 14px; padding: 16px; }
-.brand { margin: 0; font-size: 24px; letter-spacing: .2px; }
-h2 { margin: 0; font-size: 18px; }
-h3 { margin: 0; font-size: 28px; line-height: 1.2; }
-.subtle { margin: 0; color: var(--muted); }
-.tiny { font-size: 12px; }
-.row { margin-bottom: 12px; }
-.row-inline { display: flex; flex-wrap: wrap; gap: 8px; }
-input, select, button {
-  border-radius: 10px;
   border: 1px solid var(--line);
-  padding: 8px 10px;
+  box-shadow: var(--el-shadow-light);
+  backdrop-filter: none;
+}
+
+.card {
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.brand {
+  margin: 0;
+  font-size: 22px;
+  letter-spacing: .2px;
+}
+
+h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+h3 {
+  margin: 0;
+  font-size: 28px;
+  line-height: 1.2;
+}
+
+.subtle {
+  margin: 0;
+  color: var(--muted);
+}
+
+.tiny {
+  font-size: 12px;
+}
+
+.row {
+  margin-bottom: 12px;
+}
+
+.row-inline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+input, select, button {
+  border-radius: 4px;
+  border: 1px solid #dcdfe6;
+  padding: 8px 11px;
   font-size: 14px;
   background: #fff;
+  transition: all .2s;
 }
-input, select { min-width: 120px; }
-button { cursor: pointer; }
+
+input, select {
+  min-width: 120px;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:not(.btn-primary):not(.btn-danger):not(.menu-item) {
+  border-color: #dcdfe6;
+  color: #606266;
+  background: #fff;
+}
+
+button:not(.btn-primary):not(.btn-danger):not(.menu-item):hover {
+  color: #409eff;
+  border-color: #c6e2ff;
+  background: #ecf5ff;
+}
+
 .btn-primary {
-  border: none;
+  border: 1px solid #409eff;
   color: #fff;
-  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  background: #409eff;
 }
+
+.btn-primary:hover {
+  background: #66b1ff;
+  border-color: #66b1ff;
+}
+
 .btn-ghost {
   background: #fff;
-  color: var(--ink);
+  color: #606266;
+  border-color: #dcdfe6;
 }
+
+.btn-ghost:hover {
+  color: #409eff;
+  border-color: #c6e2ff;
+  background: #ecf5ff;
+}
+
 .btn-danger {
-  border: none;
+  border: 1px solid #f56c6c;
   color: #fff;
-  background: linear-gradient(135deg, #ef4444, #dc2626);
+  background: #f56c6c;
 }
-.topbar {
-  margin: 16px;
-  padding: 14px 16px;
-  border-radius: 14px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
+
+.btn-danger:hover {
+  background: #f78989;
+  border-color: #f78989;
 }
-.workplace {
-  margin: 16px;
+
+.hidden {
+  display: none !important;
+}
+
+.console-shell {
+  min-height: 0;
   display: grid;
-  gap: 16px;
+  grid-template-columns: 260px 1fr;
+  gap: 10px;
+  padding: 10px;
+  align-items: start;
 }
-.hero-card {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-.hero-meta {
+
+.sidebar {
+  border-radius: 8px;
+  padding: 10px;
   display: grid;
-  grid-template-columns: repeat(2, minmax(120px, 1fr));
+  grid-template-rows: auto auto auto;
+  gap: 8px;
+  background: var(--menu);
+  color: var(--ink);
+  box-shadow: none;
+  border: 1px solid var(--line);
+  align-self: start;
+  position: sticky;
+  top: 10px;
+  max-height: calc(100vh - 20px);
+  overflow: auto;
+}
+
+.sidebar .subtle {
+  color: var(--muted);
+}
+
+.menu {
+  display: grid;
+  gap: 6px;
+}
+
+.menu-item {
+  width: 100%;
+  text-align: left;
+  padding: 7px 10px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: #606266;
+  font-weight: 500;
+}
+
+.menu-item.active {
+  background: #ecf5ff;
+  border-color: #d9ecff;
+  color: #409eff;
+}
+
+.menu-item:hover {
+  background: #f5f7fa;
+  color: #409eff;
+}
+
+.sidebar-foot {
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+
+.main-pane {
+  display: grid;
   gap: 10px;
 }
-.meta-item {
-  background: #f8fbff;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 8px 10px;
+
+.topbar {
+  padding: 8px 12px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
 }
-.meta-item span { display: block; color: var(--muted); font-size: 12px; }
-.meta-item strong { font-size: 14px; }
+
+.panel-view {
+  display: none;
+  gap: 10px;
+}
+
+.panel-view.active {
+  display: grid;
+}
+
 .kpi-grid {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 12px;
 }
+
 .kpi-card {
-  border-radius: 14px;
-  padding: 14px;
+  border-radius: 8px;
+  padding: 10px;
+  box-shadow: none;
 }
-.kpi-card p { margin: 0 0 8px; color: var(--muted); }
-.panel-grid {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 16px;
+
+.kpi-card p {
+  margin: 0 0 8px;
+  color: var(--muted);
 }
+
 .panel-head {
-  margin-bottom: 12px;
+  margin-bottom: 8px;
   display: flex;
   align-items: center;
   justify-content: space-between;
 }
-.table-wrap { overflow: auto; border: 1px solid var(--line); border-radius: 10px; background: #fff; }
+
+.table-wrap {
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+}
+
+.peer-name-wrap {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.peer-name-wrap input {
+  min-width: 120px;
+  width: 140px;
+}
+
+.tree-box {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  padding: 10px 12px;
+  max-height: 480px;
+  overflow: auto;
+}
+
+.tree-list {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.tree-list li {
+  margin: 4px 0;
+}
+
+.tree-node {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.tree-tag {
+  display: inline-block;
+  border: 1px solid #d9ecff;
+  background: #ecf5ff;
+  color: #409eff;
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1;
+  padding: 3px 6px;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
@@ -1616,16 +2245,17 @@ table {
 th, td {
   text-align: left;
   border-bottom: 1px solid var(--line);
-  padding: 10px 8px;
+  padding: 8px 6px;
 }
 th {
   position: sticky;
   top: 0;
   z-index: 1;
-  background: #f8fbff;
+  background: #f5f7fa;
   font-weight: 600;
-  color: #334155;
+  color: #606266;
 }
+
 .status-pill {
   display: inline-block;
   padding: 2px 8px;
@@ -1633,15 +2263,151 @@ th {
   font-size: 12px;
   font-weight: 700;
 }
-.status-online { background: #dcfce7; color: #166534; }
-.status-offline { background: #fef3c7; color: #92400e; }
-@media (max-width: 1160px) {
-  .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+.status-online {
+  background: #dcfce7;
+  color: #166534;
 }
+
+.status-offline {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.peer-suggest {
+  position: fixed;
+  z-index: 99;
+  min-width: 180px;
+  max-width: 420px;
+  max-height: 220px;
+  overflow: auto;
+  background: #fff;
+  border: 1px solid #dcdfe6;
+  border-radius: 4px;
+  box-shadow: var(--el-shadow-light);
+}
+
+.peer-suggest-item {
+  width: 100%;
+  text-align: left;
+  border: none;
+  border-bottom: 1px solid #ebeef5;
+  border-radius: 0;
+  padding: 8px 12px;
+  background: #fff;
+  color: #606266;
+}
+
+.peer-suggest-item:hover {
+  background: #f5f7fa;
+  color: #409eff;
+}
+
+.peer-suggest-item:last-child {
+  border-bottom: none;
+}
+
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  background: rgba(0, 0, 0, .35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+}
+
+.modal-card {
+  width: min(460px, calc(100vw - 24px));
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.modal-lg {
+  width: min(760px, calc(100vw - 24px));
+}
+
+.modal-card .row {
+  margin: 10px 0;
+}
+
+.modal-card input,
+.modal-card select {
+  width: 100%;
+  min-width: 0;
+}
+
+.modal-actions {
+  justify-content: flex-end;
+}
+
+.form-label {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.tag-wall {
+  min-height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fafafa;
+  padding: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #d9ecff;
+  background: #ecf5ff;
+  color: #409eff;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.chip button {
+  border: none;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  line-height: 1;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+@media (max-width: 1160px) {
+  .console-shell {
+    grid-template-columns: 220px 1fr;
+  }
+  .kpi-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 @media (max-width: 840px) {
-  .topbar, .hero-card { flex-direction: column; align-items: flex-start; gap: 10px; }
-  .kpi-grid { grid-template-columns: 1fr; }
-  .hero-meta { width: 100%; grid-template-columns: 1fr 1fr; }
+  .console-shell {
+    grid-template-columns: 1fr;
+  }
+  .sidebar {
+    grid-template-rows: auto auto auto;
+  }
+  .menu {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .topbar {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .kpi-grid {
+    grid-template-columns: 1fr;
+  }
 }
 "##;
 
@@ -1675,11 +2441,14 @@ const ADMIN_LOGIN_JS: &str = r##"(() => {
 
 const ADMIN_DASHBOARD_JS: &str = r##"(() => {
   const q = (s) => document.querySelector(s);
+  const qa = (s) => Array.from(document.querySelectorAll(s));
   const token = localStorage.getItem("adminToken") || "";
   const me = JSON.parse(localStorage.getItem("adminUser") || "{}");
   if (!token) location.href = "/admin/login";
 
   q("#welcomeText").textContent = `${me.username || "unknown"} (${me.role || "-"})`;
+  const panelTitle = q("#panelTitle");
+  let currentPanel = "overviewPanel";
 
   function tickClock() {
     const now = new Date();
@@ -1713,6 +2482,289 @@ const ADMIN_DASHBOARD_JS: &str = r##"(() => {
   let usersCache = [];
   let peersCache = [];
   let groupsCache = [];
+  let peerIds = [];
+
+  const peerSuggest = q("#peerSuggest");
+  let peerSuggestInput = null;
+  const groupAclModal = q("#groupAclModal");
+  const groupAclTitle = q("#groupAclTitle");
+  const groupAclMeta = q("#groupAclMeta");
+  const groupAclPeerInput = q("#groupAclPeerInput");
+  const groupAclAddBtn = q("#groupAclAddBtn");
+  const groupAclCloseBtn = q("#groupAclCloseBtn");
+  const groupAclMembers = q("#groupAclMembers");
+  const userAclModal = q("#userAclModal");
+  const userAclTitle = q("#userAclTitle");
+  const userAclMeta = q("#userAclMeta");
+  const userAclPeerInput = q("#userAclPeerInput");
+  const userAclAddPeerBtn = q("#userAclAddPeerBtn");
+  const userAclGroupSelect = q("#userAclGroupSelect");
+  const userAclAddGroupBtn = q("#userAclAddGroupBtn");
+  const userAclCloseBtn = q("#userAclCloseBtn");
+  const userAclPeers = q("#userAclPeers");
+  const userAclGroups = q("#userAclGroups");
+
+  const groupAclState = {
+    groupId: null,
+    name: "",
+    members: [],
+  };
+  const userAclState = {
+    userId: null,
+    username: "",
+    peers: [],
+    groups: [],
+  };
+
+  function peerDisplay(peerId) {
+    const id = String(peerId || "");
+    const peer = peersCache.find((x) => String(x.id || "") === id);
+    if (peer && peer.name) return `${peer.name} (${id})`;
+    return id;
+  }
+
+  function groupDisplay(groupId) {
+    const gid = Number(groupId);
+    const group = groupsCache.find((x) => Number(x.id) === gid);
+    if (group) return `${group.name} (${gid})`;
+    return String(groupId || "");
+  }
+
+  function closeGroupAclModal() {
+    if (!groupAclModal) return;
+    groupAclModal.classList.add("hidden");
+    hidePeerSuggest();
+  }
+
+  function closeUserAclModal() {
+    if (!userAclModal) return;
+    userAclModal.classList.add("hidden");
+    hidePeerSuggest();
+  }
+
+  function renderGroupAclMembers() {
+    if (!groupAclMembers) return;
+    const members = groupAclState.members || [];
+    if (!members.length) {
+      groupAclMembers.innerHTML = `<span class="subtle tiny">暂无设备</span>`;
+      return;
+    }
+    groupAclMembers.innerHTML = members
+      .map((peerId) => `<span class="chip">
+          <span>${esc(peerDisplay(peerId))}</span>
+          <button type="button" data-act="group-acl-remove-peer" data-peer="${esc(peerId)}" title="移除">×</button>
+        </span>`)
+      .join("");
+  }
+
+  function renderUserAclPeers() {
+    if (!userAclPeers) return;
+    const peers = userAclState.peers || [];
+    if (!peers.length) {
+      userAclPeers.innerHTML = `<span class="subtle tiny">暂无设备授权</span>`;
+      return;
+    }
+    userAclPeers.innerHTML = peers
+      .map((peerId) => `<span class="chip">
+          <span>${esc(peerDisplay(peerId))}</span>
+          <button type="button" data-act="user-acl-remove-peer" data-peer="${esc(peerId)}" title="移除">×</button>
+        </span>`)
+      .join("");
+  }
+
+  function renderUserAclGroups() {
+    if (!userAclGroups) return;
+    const groups = userAclState.groups || [];
+    if (!groups.length) {
+      userAclGroups.innerHTML = `<span class="subtle tiny">暂无设备组授权</span>`;
+      return;
+    }
+    userAclGroups.innerHTML = groups
+      .map((groupId) => `<span class="chip">
+          <span>${esc(groupDisplay(groupId))}</span>
+          <button type="button" data-act="user-acl-remove-group" data-group="${esc(groupId)}" title="移除">×</button>
+        </span>`)
+      .join("");
+  }
+
+  function renderUserAclGroupOptions() {
+    if (!userAclGroupSelect) return;
+    const options = groupsCache
+      .map((g) => `<option value="${esc(g.id)}">${esc(g.name)} (${esc(g.id)})</option>`)
+      .join("");
+    userAclGroupSelect.innerHTML = options || `<option value="">暂无设备组</option>`;
+  }
+
+  async function reloadGroupAclState() {
+    if (!groupAclState.groupId) return;
+    groupAclState.members = await api(`/api/groups/${groupAclState.groupId}/peers`).catch(() => []);
+    renderGroupAclMembers();
+  }
+
+  async function reloadUserAclState() {
+    if (!userAclState.userId) return;
+    userAclState.peers = await api(`/api/users/${userAclState.userId}/peers`).catch(() => []);
+    userAclState.groups = await api(`/api/users/${userAclState.userId}/groups`).catch(() => []);
+    renderUserAclPeers();
+    renderUserAclGroups();
+  }
+
+  async function openGroupAclModal(groupId, groupName) {
+    groupAclState.groupId = Number(groupId);
+    groupAclState.name = groupName || `Group-${groupId}`;
+    groupAclTitle.textContent = "设备组成员管理";
+    groupAclMeta.textContent = `${groupAclState.name} (ID: ${groupAclState.groupId})`;
+    await reloadGroupAclState();
+    groupAclModal.classList.remove("hidden");
+    applyPeerInputHints();
+    if (groupAclPeerInput) {
+      groupAclPeerInput.value = "";
+      setTimeout(() => {
+        groupAclPeerInput.focus();
+        showPeerSuggest(groupAclPeerInput);
+      }, 0);
+    }
+  }
+
+  async function openUserAclModal(userId, username) {
+    userAclState.userId = Number(userId);
+    userAclState.username = username || `User-${userId}`;
+    userAclTitle.textContent = "用户权限管理";
+    userAclMeta.textContent = `${userAclState.username} (ID: ${userAclState.userId})`;
+    renderUserAclGroupOptions();
+    await reloadUserAclState();
+    userAclModal.classList.remove("hidden");
+    applyPeerInputHints();
+    if (userAclPeerInput) {
+      userAclPeerInput.value = "";
+      setTimeout(() => {
+        userAclPeerInput.focus();
+        showPeerSuggest(userAclPeerInput);
+      }, 0);
+    }
+  }
+
+  async function reloadAclViews() {
+    await loadGroups();
+    await loadUsers();
+    await loadClients();
+    await loadGroupTree();
+    await loadUserTree();
+  }
+
+  groupAclCloseBtn?.addEventListener("click", closeGroupAclModal);
+  userAclCloseBtn?.addEventListener("click", closeUserAclModal);
+
+  groupAclModal?.addEventListener("click", (e) => {
+    if (e.target === groupAclModal) closeGroupAclModal();
+  });
+  userAclModal?.addEventListener("click", (e) => {
+    if (e.target === userAclModal) closeUserAclModal();
+  });
+
+  groupAclAddBtn?.addEventListener("click", async () => {
+    const peerId = (groupAclPeerInput?.value || "").trim();
+    if (!peerId) return alert("请填写设备ID");
+    try {
+      await api(`/api/groups/${groupAclState.groupId}/peers/${encodeURIComponent(peerId)}`, "POST");
+      if (groupAclPeerInput) groupAclPeerInput.value = "";
+      await reloadGroupAclState();
+      await reloadAclViews();
+    } catch (e) {
+      alert(e.message);
+    }
+  });
+
+  groupAclMembers?.addEventListener("click", async (e) => {
+    const btn = e.target.closest('button[data-act="group-acl-remove-peer"]');
+    if (!btn) return;
+    const peerId = btn.getAttribute("data-peer");
+    if (!peerId) return;
+    try {
+      await api(`/api/groups/${groupAclState.groupId}/peers/${encodeURIComponent(peerId)}`, "DELETE");
+      await reloadGroupAclState();
+      await reloadAclViews();
+    } catch (e) {
+      alert(e.message);
+    }
+  });
+
+  userAclAddPeerBtn?.addEventListener("click", async () => {
+    const peerId = (userAclPeerInput?.value || "").trim();
+    if (!peerId) return alert("请填写设备ID");
+    try {
+      await api(`/api/users/${userAclState.userId}/peers/${encodeURIComponent(peerId)}`, "POST");
+      if (userAclPeerInput) userAclPeerInput.value = "";
+      await reloadUserAclState();
+      await reloadAclViews();
+    } catch (e) {
+      alert(e.message);
+    }
+  });
+
+  userAclAddGroupBtn?.addEventListener("click", async () => {
+    const groupId = String(userAclGroupSelect?.value || "").trim();
+    if (!groupId) return alert("请先选择设备组");
+    try {
+      await api(`/api/users/${userAclState.userId}/groups/${encodeURIComponent(groupId)}`, "POST");
+      await reloadUserAclState();
+      await reloadAclViews();
+    } catch (e) {
+      alert(e.message);
+    }
+  });
+
+  userAclPeers?.addEventListener("click", async (e) => {
+    const btn = e.target.closest('button[data-act="user-acl-remove-peer"]');
+    if (!btn) return;
+    const peerId = btn.getAttribute("data-peer");
+    if (!peerId) return;
+    try {
+      await api(`/api/users/${userAclState.userId}/peers/${encodeURIComponent(peerId)}`, "DELETE");
+      await reloadUserAclState();
+      await reloadAclViews();
+    } catch (e) {
+      alert(e.message);
+    }
+  });
+
+  userAclGroups?.addEventListener("click", async (e) => {
+    const btn = e.target.closest('button[data-act="user-acl-remove-group"]');
+    if (!btn) return;
+    const groupId = btn.getAttribute("data-group");
+    if (!groupId) return;
+    try {
+      await api(`/api/users/${userAclState.userId}/groups/${encodeURIComponent(groupId)}`, "DELETE");
+      await reloadUserAclState();
+      await reloadAclViews();
+    } catch (e) {
+      alert(e.message);
+    }
+  });
+
+  function setPanelVisible(panelId, visible) {
+    const panel = q(`#${panelId}`);
+    const menu = q(`.menu-item[data-panel="${panelId}"]`);
+    if (panel) panel.classList.toggle("hidden", !visible);
+    if (menu) menu.classList.toggle("hidden", !visible);
+    if (!visible && currentPanel === panelId) {
+      showPanel("overviewPanel");
+    }
+  }
+
+  function showPanel(panelId) {
+    const target = q(`#${panelId}`);
+    if (!target || target.classList.contains("hidden")) return;
+    currentPanel = panelId;
+    qa(".panel-view").forEach((panel) => panel.classList.toggle("active", panel.id === panelId));
+    qa(".menu-item").forEach((item) => item.classList.toggle("active", item.dataset.panel === panelId));
+    panelTitle.textContent = target.dataset.title || "工作台";
+    hidePeerSuggest();
+  }
+
+  qa(".menu-item").forEach((item) => {
+    item.addEventListener("click", () => showPanel(item.dataset.panel));
+  });
 
   function renderKpis() {
     const enabledUsers = usersCache.filter((u) => Number(u.status) !== 0).length;
@@ -1725,14 +2777,108 @@ const ADMIN_DASHBOARD_JS: &str = r##"(() => {
     if (g) g.textContent = String(groupsCache.length);
   }
 
+  function refreshPeerCandidates() {
+    peerIds = peersCache.map((p) => String(p.id || "")).filter((x) => x.length > 0);
+    const dl = q("#peerIdCandidates");
+    if (!dl) return;
+    dl.innerHTML = peerIds
+      .slice(0, 1000)
+      .map((id) => `<option value="${esc(id)}"></option>`)
+      .join("");
+  }
+
+  function applyPeerInputHints() {
+    qa("input.aclPeer").forEach((input) => {
+      input.setAttribute("list", "peerIdCandidates");
+      input.setAttribute("autocomplete", "off");
+    });
+  }
+
+  function fuzzyPeerIds(text) {
+    const key = String(text || "").trim().toLowerCase();
+    if (!key) return peerIds.slice(0, 12);
+    const prefix = [];
+    const contains = [];
+    for (const id of peerIds) {
+      const low = id.toLowerCase();
+      if (low.startsWith(key)) prefix.push(id);
+      else if (low.includes(key)) contains.push(id);
+    }
+    return prefix.concat(contains).slice(0, 20);
+  }
+
+  function hidePeerSuggest() {
+    if (!peerSuggest) return;
+    peerSuggest.classList.add("hidden");
+    peerSuggest.innerHTML = "";
+    peerSuggestInput = null;
+  }
+
+  function showPeerSuggest(input) {
+    if (!peerSuggest) return;
+    const items = fuzzyPeerIds(input.value);
+    if (!items.length) return hidePeerSuggest();
+    peerSuggestInput = input;
+    const rect = input.getBoundingClientRect();
+    peerSuggest.style.left = `${Math.round(rect.left)}px`;
+    peerSuggest.style.top = `${Math.round(rect.bottom + 4)}px`;
+    peerSuggest.style.width = `${Math.max(180, Math.round(rect.width))}px`;
+    peerSuggest.innerHTML = items
+      .map((id) => `<button type="button" class="peer-suggest-item" data-peer-id="${esc(id)}">${esc(id)}</button>`)
+      .join("");
+    peerSuggest.classList.remove("hidden");
+  }
+
+  document.addEventListener("input", (e) => {
+    const t = e.target;
+    if (t && t.matches("input.aclPeer")) {
+      showPeerSuggest(t);
+    }
+  });
+
+  document.addEventListener("focusin", (e) => {
+    const t = e.target;
+    if (t && t.matches("input.aclPeer")) {
+      showPeerSuggest(t);
+    }
+  });
+
+  document.addEventListener("click", (e) => {
+    const item = e.target.closest(".peer-suggest-item");
+    if (item && peerSuggestInput) {
+      peerSuggestInput.value = item.getAttribute("data-peer-id") || "";
+      hidePeerSuggest();
+      return;
+    }
+    const t = e.target;
+    if (!(t && (t.matches("input.aclPeer") || t.closest("#peerSuggest")))) {
+      hidePeerSuggest();
+    }
+  });
+
+  window.addEventListener("resize", () => {
+    if (peerSuggestInput) showPeerSuggest(peerSuggestInput);
+  });
+  window.addEventListener("scroll", () => {
+    if (peerSuggestInput) showPeerSuggest(peerSuggestInput);
+  }, true);
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      hidePeerSuggest();
+      if (groupAclModal && !groupAclModal.classList.contains("hidden")) closeGroupAclModal();
+      if (userAclModal && !userAclModal.classList.contains("hidden")) closeUserAclModal();
+    }
+  });
+
   async function loadGroups() {
     if (me.role !== "admin") {
-      const card = q("#groupCard");
-      if (card) card.style.display = "none";
+      setPanelVisible("groupsPanel", false);
       groupsCache = [];
       renderKpis();
       return;
     }
+    setPanelVisible("groupsPanel", true);
     groupsCache = await api("/api/groups").catch(() => []);
     const tbody = q("#groupsTbl tbody");
     if (!tbody) {
@@ -1744,10 +2890,8 @@ const ADMIN_DASHBOARD_JS: &str = r##"(() => {
       const members = await api(`/api/groups/${g.id}/peers`).catch(() => []);
       const tr = document.createElement("tr");
       tr.innerHTML = `<td>${g.id}</td><td>${esc(g.name)}</td><td>${esc(members.join(", "))}</td><td>${esc(g.created_at)}</td><td>
-        <input data-group="${g.id}" class="groupPeer" placeholder="设备ID" style="width:120px" />
-        <button class="btn-primary" data-group="${g.id}" data-act="groupAddPeer">加设备</button>
-        <button data-group="${g.id}" data-act="groupRmPeer">移设备</button>
-        <button class="btn-danger" data-group="${g.id}" data-act="groupDelete">删组</button>
+        <button class="btn-primary el-button el-button--primary el-button--small" data-group="${g.id}" data-group-name="${esc(g.name)}" data-act="groupManagePeers">成员管理</button>
+        <button class="btn-danger el-button el-button--danger el-button--small" data-group="${g.id}" data-act="groupDelete">删组</button>
       </td>`;
       tbody.appendChild(tr);
     }
@@ -1756,11 +2900,12 @@ const ADMIN_DASHBOARD_JS: &str = r##"(() => {
 
   async function loadUsers() {
     if (me.role !== "admin") {
-      q("#userCard").style.display = "none";
+      setPanelVisible("usersPanel", false);
       usersCache = [];
       renderKpis();
       return;
     }
+    setPanelVisible("usersPanel", true);
     usersCache = await api("/api/users").catch(() => []);
     const tbody = q("#usersTbl tbody");
     tbody.innerHTML = "";
@@ -1769,15 +2914,10 @@ const ADMIN_DASHBOARD_JS: &str = r##"(() => {
       const gAcl = await api(`/api/users/${u.id}/groups`).catch(() => []);
       const tr = document.createElement("tr");
       tr.innerHTML = `<td>${u.id}</td><td>${esc(u.username)}</td><td>${esc(u.role)}</td><td>${Number(u.status) === 0 ? "disabled" : "enabled"}</td><td>${esc(u.created_at)}</td><td>${esc(acl.join(", "))}</td><td>${esc(gAcl.join(", "))}</td><td>
-        <input data-user="${u.id}" class="aclPeer" placeholder="设备ID" style="width:110px" />
-        <button class="btn-primary" data-user="${u.id}" data-act="grant">授权设备</button>
-        <button data-user="${u.id}" data-act="revoke">撤销设备</button>
-        <input data-user="${u.id}" class="aclGroup" placeholder="组ID" style="width:80px" />
-        <button class="btn-primary" data-user="${u.id}" data-act="grantGroup">授权组</button>
-        <button data-user="${u.id}" data-act="revokeGroup">撤销组</button>
+        <button class="btn-primary el-button el-button--primary el-button--small" data-user="${u.id}" data-username="${esc(u.username)}" data-act="userManageAcl">权限管理</button>
         <button data-user="${u.id}" data-act="enable">启用</button>
         <button data-user="${u.id}" data-act="disable">禁用</button>
-        <button data-user="${u.id}" data-act="delete" class="btn-danger">删除</button>
+        <button data-user="${u.id}" data-act="delete" class="btn-danger el-button el-button--danger el-button--small">删除</button>
       </td>`;
       tbody.appendChild(tr);
     }
@@ -1786,29 +2926,150 @@ const ADMIN_DASHBOARD_JS: &str = r##"(() => {
 
   async function loadClients() {
     peersCache = await api("/api/peers").catch(() => []);
+    refreshPeerCandidates();
+    applyPeerInputHints();
     const tbody = q("#clientsTbl tbody");
     tbody.innerHTML = "";
     for (const c of peersCache) {
       const statusClass = c.online ? "status-online" : "status-offline";
       const statusText = c.online ? "online" : "offline";
       const dbStatus = Number(c.status) === 0 ? "disabled" : "enabled";
+      const controlType = c.is_controlled ? "被控端" : "普通设备";
+      const nameValue = esc(c.name || "");
+      const nameCell = me.role === "admin"
+        ? `<div class="peer-name-wrap">
+             <input class="peerNameInput" data-peer="${esc(c.id)}" placeholder="设备名称" value="${nameValue}" />
+             <button class="btn-primary el-button el-button--primary el-button--small" data-peer="${esc(c.id)}" data-act="peer-save-name">保存</button>
+           </div>`
+        : (nameValue || "-");
       const actions = me.role === "admin"
-        ? `<button data-peer="${esc(c.id)}" data-act="peer-enable">启用</button>
+        ? `${c.is_controlled
+              ? `<button data-peer="${esc(c.id)}" data-act="peer-unmark-controlled">取消被控</button>`
+              : `<button class="btn-primary el-button el-button--primary el-button--small" data-peer="${esc(c.id)}" data-act="peer-mark-controlled">标记被控</button>`}
+           <button data-peer="${esc(c.id)}" data-act="peer-enable">启用</button>
            <button data-peer="${esc(c.id)}" data-act="peer-disable">禁用</button>
-           <button data-peer="${esc(c.id)}" data-act="peer-delete" class="btn-danger">删除</button>`
+           <button data-peer="${esc(c.id)}" data-act="peer-delete" class="btn-danger el-button el-button--danger el-button--small">删除</button>`
         : "-";
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td>${esc(c.id)}</td><td><span class="status-pill ${statusClass}">${statusText}</span></td><td>${dbStatus}</td><td>${c.last_seen_secs ?? "-"}</td><td>${esc(c.ip || "-")}</td><td>${esc(c.created_at)}</td><td>${actions}</td>`;
+      tr.innerHTML = `<td>${esc(c.id)}</td><td>${nameCell}</td><td><span class="status-pill ${statusClass}">${statusText}</span></td><td>${dbStatus}</td><td>${controlType}</td><td>${c.last_seen_secs ?? "-"}</td><td>${esc(c.ip || "-")}</td><td>${esc(c.created_at)}</td><td>${actions}</td>`;
       tbody.appendChild(tr);
     }
     renderKpis();
   }
 
-  async function loadAudits() {
-    if (me.role !== "admin") {
-      q("#auditCard").style.display = "none";
+  function renderDeviceTreeList(devices) {
+    if (!devices || !devices.length) return `<div class="subtle tiny">暂无设备</div>`;
+    return `<ul class="tree-list">${devices
+      .map((d) => {
+        const name = String(d.name || "").trim();
+        const online = d.online ? "在线" : "离线";
+        const status = Number(d.status) === 0 ? "禁用" : "启用";
+        const controlled = d.is_controlled ? "被控端" : "普通";
+        const title = name
+          ? `${esc(name)} <span class="subtle tiny">(${esc(d.id || "")})</span>`
+          : esc(d.id || "");
+        return `<li>
+          <div class="tree-node">
+            <span>${title}</span>
+            <span class="tree-tag">${online}</span>
+            <span class="tree-tag">${status}</span>
+            <span class="tree-tag">${controlled}</span>
+          </div>
+        </li>`;
+      })
+      .join("")}</ul>`;
+  }
+
+  function renderGroupTree(rows) {
+    const box = q("#groupTreeBox");
+    if (!box) return;
+    if (!rows || !rows.length) {
+      box.innerHTML = `<div class="subtle">暂无设备组</div>`;
       return;
     }
+    box.innerHTML = `<ul class="tree-list">${rows
+      .map(
+        (g) => `<li>
+          <div class="tree-node">
+            <strong>${esc(g.name || `Group-${g.id}`)}</strong>
+            <span class="tree-tag">组ID: ${esc(g.id)}</span>
+            <span class="tree-tag">设备: ${Array.isArray(g.devices) ? g.devices.length : 0}</span>
+          </div>
+          ${renderDeviceTreeList(g.devices || [])}
+        </li>`
+      )
+      .join("")}</ul>`;
+  }
+
+  function renderUserTree(rows) {
+    const box = q("#userTreeBox");
+    if (!box) return;
+    if (!rows || !rows.length) {
+      box.innerHTML = `<div class="subtle">暂无关联数据</div>`;
+      return;
+    }
+    box.innerHTML = `<ul class="tree-list">${rows
+      .map((u) => {
+        const status = Number(u.status) === 0 ? "禁用" : "启用";
+        const groups = Array.isArray(u.groups) ? u.groups : [];
+        const direct = Array.isArray(u.direct_devices) ? u.direct_devices : [];
+        const groupBlocks = groups
+          .map(
+            (g) => `<li>
+              <div class="tree-node">
+                <span>${esc(g.name || `Group-${g.id}`)}</span>
+                <span class="tree-tag">组ID: ${esc(g.id)}</span>
+              </div>
+              ${renderDeviceTreeList(g.devices || [])}
+            </li>`
+          )
+          .join("");
+        return `<li>
+          <div class="tree-node">
+            <strong>${esc(u.username || `User-${u.id}`)}</strong>
+            <span class="tree-tag">${esc(u.role || "user")}</span>
+            <span class="tree-tag">${status}</span>
+            <span class="tree-tag">用户ID: ${esc(u.id)}</span>
+          </div>
+          <ul class="tree-list">
+            <li>
+              <div class="tree-node"><span>设备组授权</span><span class="tree-tag">${groups.length}</span></div>
+              ${groups.length ? `<ul class="tree-list">${groupBlocks}</ul>` : `<div class="subtle tiny">暂无设备组授权</div>`}
+            </li>
+            <li>
+              <div class="tree-node"><span>直接设备授权</span><span class="tree-tag">${direct.length}</span></div>
+              ${renderDeviceTreeList(direct)}
+            </li>
+          </ul>
+        </li>`;
+      })
+      .join("")}</ul>`;
+  }
+
+  async function loadGroupTree() {
+    const box = q("#groupTreeBox");
+    if (!box) return;
+    if (me.role !== "admin") {
+      box.innerHTML = `<div class="subtle">仅管理员可查看设备组树</div>`;
+      return;
+    }
+    const rows = await api("/api/tree/groups").catch(() => []);
+    renderGroupTree(rows);
+  }
+
+  async function loadUserTree() {
+    const box = q("#userTreeBox");
+    if (!box) return;
+    const rows = await api("/api/tree/users").catch(() => []);
+    renderUserTree(rows);
+  }
+
+  async function loadAudits() {
+    if (me.role !== "admin") {
+      setPanelVisible("auditsPanel", false);
+      return;
+    }
+    setPanelVisible("auditsPanel", true);
     const rows = await api("/api/audits/conn?limit=100").catch(() => []);
     const tbody = q("#auditTbl tbody");
     tbody.innerHTML = "";
@@ -1823,6 +3084,8 @@ const ADMIN_DASHBOARD_JS: &str = r##"(() => {
     await loadGroups();
     await loadUsers();
     await loadClients();
+    await loadGroupTree();
+    await loadUserTree();
     await loadAudits();
   }
 
@@ -1832,6 +3095,8 @@ const ADMIN_DASHBOARD_JS: &str = r##"(() => {
       q("#newGroup").value = "";
       await loadGroups();
       await loadUsers();
+      await loadGroupTree();
+      await loadUserTree();
     } catch (e) {
       alert(e.message);
     }
@@ -1843,24 +3108,15 @@ const ADMIN_DASHBOARD_JS: &str = r##"(() => {
     const groupId = btn.getAttribute("data-group");
     const act = btn.getAttribute("data-act");
     try {
-      if (act === "groupDelete") {
+      if (act === "groupManagePeers") {
+        const groupName = btn.getAttribute("data-group-name") || `Group-${groupId}`;
+        await openGroupAclModal(groupId, groupName);
+        return;
+      } else if (act === "groupDelete") {
         if (!confirm(`确认删除设备组 ${groupId} 吗？`)) return;
         await api(`/api/groups/${groupId}`, "DELETE");
-      } else {
-        const input = q(`input.groupPeer[data-group="${groupId}"]`);
-        const peerId = (input?.value || "").trim();
-        if (!peerId) return alert("请填写设备ID");
-        if (act === "groupAddPeer") {
-          await api(`/api/groups/${groupId}/peers/${encodeURIComponent(peerId)}`, "POST");
-        } else if (act === "groupRmPeer") {
-          await api(`/api/groups/${groupId}/peers/${encodeURIComponent(peerId)}`, "DELETE");
-        }
       }
-      await loadGroups();
-      await loadUsers();
-      await loadClients();
-      await loadGroups();
-      await loadUsers();
+      await reloadAclViews();
     } catch (e) {
       alert(e.message);
     }
@@ -1884,16 +3140,10 @@ const ADMIN_DASHBOARD_JS: &str = r##"(() => {
     const userId = btn.getAttribute("data-user");
     const act = btn.getAttribute("data-act");
     try {
-      if (act === "grant" || act === "revoke") {
-        const input = q(`input.aclPeer[data-user="${userId}"]`);
-        const peerId = (input?.value || "").trim();
-        if (!peerId) return alert("请填写设备ID");
-        await api(`/api/users/${userId}/peers/${encodeURIComponent(peerId)}`, act === "grant" ? "POST" : "DELETE");
-      } else if (act === "grantGroup" || act === "revokeGroup") {
-        const input = q(`input.aclGroup[data-user="${userId}"]`);
-        const groupId = (input?.value || "").trim();
-        if (!groupId) return alert("请填写组ID");
-        await api(`/api/users/${userId}/groups/${encodeURIComponent(groupId)}`, act === "grantGroup" ? "POST" : "DELETE");
+      if (act === "userManageAcl") {
+        const username = btn.getAttribute("data-username") || `User-${userId}`;
+        await openUserAclModal(userId, username);
+        return;
       } else if (act === "enable") {
         await api(`/api/users/${userId}/enable`, "POST");
       } else if (act === "disable") {
@@ -1902,9 +3152,7 @@ const ADMIN_DASHBOARD_JS: &str = r##"(() => {
         if (!confirm(`确认删除用户 ${userId} 吗？`)) return;
         await api(`/api/users/${userId}`, "DELETE");
       }
-      await loadUsers();
-      await loadGroups();
-      await loadClients();
+      await reloadAclViews();
     } catch (e) {
       alert(e.message);
     }
@@ -1916,6 +3164,13 @@ const ADMIN_DASHBOARD_JS: &str = r##"(() => {
     const peerId = btn.getAttribute("data-peer");
     const act = btn.getAttribute("data-act");
     try {
+      if (act === "peer-save-name") {
+        const input = btn.closest(".peer-name-wrap")?.querySelector("input.peerNameInput");
+        const name = (input?.value || "").trim();
+        await api(`/api/peers/${encodeURIComponent(peerId)}/name`, "PUT", { name: name || null });
+      }
+      if (act === "peer-mark-controlled") await api(`/api/peers/${encodeURIComponent(peerId)}/mark-controlled`, "POST");
+      if (act === "peer-unmark-controlled") await api(`/api/peers/${encodeURIComponent(peerId)}/unmark-controlled`, "POST");
       if (act === "peer-enable") await api(`/api/peers/${encodeURIComponent(peerId)}/enable`, "POST");
       if (act === "peer-disable") await api(`/api/peers/${encodeURIComponent(peerId)}/disable`, "POST");
       if (act === "peer-delete") {
@@ -1925,6 +3180,8 @@ const ADMIN_DASHBOARD_JS: &str = r##"(() => {
       await loadClients();
       await loadGroups();
       await loadUsers();
+      await loadGroupTree();
+      await loadUserTree();
     } catch (e) {
       alert(e.message);
     }
@@ -1940,8 +3197,18 @@ const ADMIN_DASHBOARD_JS: &str = r##"(() => {
   };
 
   (async () => {
+    if (me.role !== "admin") {
+      qa(".admin-only").forEach((x) => x.classList.add("hidden"));
+    }
+    showPanel("overviewPanel");
     await refreshAll();
-    setInterval(loadClients, 5000);
+    setInterval(async () => {
+      await loadClients().catch(() => {});
+      if (me.role === "admin") {
+        await loadGroupTree().catch(() => {});
+      }
+      await loadUserTree().catch(() => {});
+    }, 5000);
   })();
 })();
 "##;
